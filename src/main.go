@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	// "go.opentelemetry.io/otel/exporters/otlp/otlpmetric"
 	"go.opentelemetry.io/otel/metric"
 	mglobal "go.opentelemetry.io/otel/metric/global"
 	"go.opentelemetry.io/otel/propagation"
@@ -80,6 +81,15 @@ func main() {
 	otel.SetTracerProvider(tracerProvider)
 
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	//Establish metrics exporter
+	// metricClient := otlpMetric.client()
+	// otlpmetricExp, err := otlpmetric.New(ctx, metricClient)
+
+	// // Set Prometheus metrics
+	// prom, err := prometheus.InstallNewPipeline(prometheus.Config{
+	// 	DefaultHistogramBoundaries: []float64{0.5, 0.9, 0.99},
+	// })
 
 	mux := http.NewServeMux()
 	mux.Handle("/", otelhttp.NewHandler(otelhttp.WithRouteTag("/", http.HandlerFunc(rootHandler)), "root", otelhttp.WithPublicEndpoint()))
