@@ -19,7 +19,8 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
-	// "go.opentelemetry.io/otel/exporters/otlp/otlpmetric"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
 	mglobal "go.opentelemetry.io/otel/metric/global"
 	"go.opentelemetry.io/otel/propagation"
@@ -29,6 +30,9 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding/gzip"
+	controller "go.opentelemetry.io/otel/sdk/metric/controller/basic"
+	processor "go.opentelemetry.io/otel/sdk/metric/processor/basic"
+	selector "go.opentelemetry.io/otel/sdk/metric/selector/simple"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
@@ -58,7 +62,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	//OTLP exporter
+	//OTLP trace exporter
 	exporter, err := otlptrace.New(ctx, otlptracegrpc.NewClient(
 		otlptracegrpc.WithTLSCredentials(credentials.NewClientTLSFromCert(nil, "")),
 		otlptracegrpc.WithEndpoint("ingest.lightstep.com:443"),
@@ -68,7 +72,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Could not start web server: %s", err)
 	}
-	
+
 	// Define TracerProvider
 	tracerProvider := sdktrace.NewTracerProvider(
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
@@ -80,25 +84,58 @@ func main() {
 	// Set TracerProvider
 	otel.SetTracerProvider(tracerProvider)
 
+	//Establish metrics client
+	metricClient := otlpmetricgrpc.NewClient(
+		otlpmetricgrpc.WithTLSCredentials(credentials.NewClientTLSFromCert(nil, "")),
+		otlpmetricgrpc.WithEndpoint("ingest.lightstep.com:443"),
+		otlpmetricgrpc.WithHeaders(map[string]string{"lightstep-access-token":ls_access_token}),
+		otlpmetricgrpc.WithCompressor(gzip.Name),
+	)
+
+	//Declare metrics exporter
+	mExporter, err := otlpmetric.New(
+		ctx,
+		metricClient,
+	)
+
+	//Set metric controller
+	metricController := controller.New(
+		processor.NewFactory(
+			selector.NewWithHistogramDistribution(),
+			mExporter,
+		),
+		controller.WithResource(newResource()),
+		controller.WithExporter(mExporter),
+		controller.WithCollectPeriod(2*time.Second),
+	)
+
+	mglobal.SetMeterProvider(metricController)
+
+	if err := metricController.Start(ctx); err != nil {
+		log.Fatalf("could not start metric controller: %v", err)
+	}
+
+	defer func() {
+		ctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		// pushes any last exports to the receiver
+		if err := metricController.Stop(ctx); err != nil {
+			otel.Handle(err)
+		}
+	}()
+
+	//Set propagation headers
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
-	//Establish metrics exporter
-	// metricClient := otlpMetric.client()
-	// otlpmetricExp, err := otlpmetric.New(ctx, metricClient)
-
-	// // Set Prometheus metrics
-	// prom, err := prometheus.InstallNewPipeline(prometheus.Config{
-	// 	DefaultHistogramBoundaries: []float64{0.5, 0.9, 0.99},
-	// })
 
 	mux := http.NewServeMux()
 	mux.Handle("/", otelhttp.NewHandler(otelhttp.WithRouteTag("/", http.HandlerFunc(rootHandler)), "root", otelhttp.WithPublicEndpoint()))
 	mux.Handle("/favicon.ico", http.NotFoundHandler())
 	mux.Handle("/fib", otelhttp.NewHandler(otelhttp.WithRouteTag("/fib", http.HandlerFunc(fibHandler)), "fibonacci", otelhttp.WithPublicEndpoint()))
 	mux.Handle("/fibinternal", otelhttp.NewHandler(otelhttp.WithRouteTag("/fibinternal", http.HandlerFunc(fibHandler)), "fibonacci"))
-	// mux.Handle("/metrics", prom)
 	os.Stderr.WriteString("Initializing the server...\n")
 
+	//Start metric collection
 	go updateDiskMetrics(context.Background())
 
 	err = http.ListenAndServe("127.0.0.1:3000", mux)
@@ -190,10 +227,13 @@ func fibHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func updateDiskMetrics(ctx context.Context) {
-	appKey := attribute.Key("glitch.com/app")                // The Glitch app name.
-	containerKey := attribute.Key("glitch.com/container_id") // The Glitch container id.
+	//Set attributes for all metrics
+	appKey := attribute.Key("fib")
+	containerKey := attribute.Key(os.Getenv("HOSTNAME"))
 
+	//Declare a meter to collect metrics
 	meter := mglobal.Meter("container")
+	//Declare specific metrics with descriptions to collect
 	mem, _ := meter.NewInt64Counter("mem_usage",
 		metric.WithDescription("Amount of memory used."),
 	)
@@ -209,6 +249,7 @@ func updateDiskMetrics(ctx context.Context) {
 
 	var m runtime.MemStats
 	for {
+		//Read metrics from the machine
 		runtime.ReadMemStats(&m)
 
 		var stat syscall.Statfs_t
@@ -218,6 +259,7 @@ func updateDiskMetrics(ctx context.Context) {
 		all := float64(stat.Blocks) * float64(stat.Bsize)
 		free := float64(stat.Bfree) * float64(stat.Bsize)
 
+		//Assign observed metric values to our declared meters
 		meter.RecordBatch(ctx, []attribute.KeyValue{
 			appKey.String(os.Getenv("PROJECT_DOMAIN")),
 			containerKey.String(os.Getenv("HOSTNAME"))},
