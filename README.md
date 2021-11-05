@@ -6,5 +6,7 @@ In order to run the program, you will need Go v1.16+ installed
 Clone the project, and run:
 
 $ cd ${DOWNLOAD_DIR}/src
+
 $ go mod download
+
 $ go run .
